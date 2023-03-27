@@ -136,6 +136,8 @@ struct virtqueue_stats {
 	/* Size bins in array as RFC 2819, undersized [0], 64 [1], etc */
 	uint64_t size_bins[8];
 	uint64_t guest_notifications;
+	uint64_t guest_notifications_offloaded;
+	uint64_t guest_notifications_error;
 	uint64_t iotlb_hits;
 	uint64_t iotlb_misses;
 	uint64_t inflight_submitted;
@@ -884,6 +886,32 @@ vhost_need_event(uint16_t event_idx, uint16_t new_idx, uint16_t old)
 }
 
 static __rte_always_inline void
+vhost_vring_inject_irq(struct virtio_net *dev, struct vhost_virtqueue *vq)
+{
+	int ret;
+
+	if (dev->notify_ops->guest_notify &&
+	    dev->notify_ops->guest_notify(dev->vid, vq->index)) {
+		if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+			vq->stats.guest_notifications_offloaded++;
+		return;
+	}
+
+	ret = eventfd_write(vq->callfd, (eventfd_t) 1);
+	if (ret) {
+		if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+			vq->stats.guest_notifications_error++;
+		return;
+	}
+
+	if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
+		vq->stats.guest_notifications++;
+	if (dev->notify_ops->guest_notified)
+		dev->notify_ops->guest_notified(dev->vid);
+}
+
+
+static __rte_always_inline void
 vhost_vring_call_split(struct virtio_net *dev, struct vhost_virtqueue *vq)
 {
 	/* Flush used->idx update before we read avail->flags. */
@@ -902,24 +930,16 @@ vhost_vring_call_split(struct virtio_net *dev, struct vhost_virtqueue *vq)
 			"%s: used_event_idx=%d, old=%d, new=%d\n",
 			__func__, vhost_used_event(vq), old, new);
 
-		if ((vhost_need_event(vhost_used_event(vq), new, old) &&
-					(vq->callfd >= 0)) ||
-				unlikely(!signalled_used_valid)) {
-			eventfd_write(vq->callfd, (eventfd_t) 1);
-			if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
-				vq->stats.guest_notifications++;
-			if (dev->notify_ops->guest_notified)
-				dev->notify_ops->guest_notified(dev->vid);
+		if ((vhost_need_event(vhost_used_event(vq), new, old) ||
+		     unlikely(!signalled_used_valid)) &&
+		    vq->callfd >= 0) {
+			vhost_vring_inject_irq(dev, vq);
 		}
 	} else {
 		/* Kick the guest if necessary. */
 		if (!(vq->avail->flags & VRING_AVAIL_F_NO_INTERRUPT)
 				&& (vq->callfd >= 0)) {
-			eventfd_write(vq->callfd, (eventfd_t)1);
-			if (dev->flags & VIRTIO_DEV_STATS_ENABLED)
-				vq->stats.guest_notifications++;
-			if (dev->notify_ops->guest_notified)
-				dev->notify_ops->guest_notified(dev->vid);
+			vhost_vring_inject_irq(dev, vq);
 		}
 	}
 }
@@ -971,11 +991,8 @@ vhost_vring_call_packed(struct virtio_net *dev, struct vhost_virtqueue *vq)
 	if (vhost_need_event(off, new, old))
 		kick = true;
 kick:
-	if (kick) {
-		eventfd_write(vq->callfd, (eventfd_t)1);
-		if (dev->notify_ops->guest_notified)
-			dev->notify_ops->guest_notified(dev->vid);
-	}
+	if (kick && vq->callfd >= 0)
+		vhost_vring_inject_irq(dev, vq);
 }
 
 static __rte_always_inline void
